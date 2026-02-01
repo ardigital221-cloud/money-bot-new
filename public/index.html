@@ -1,82 +1,83 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Финансы</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: sans-serif; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #000); padding: 20px; }
-        .balance { font-size: 32px; font-weight: bold; text-align: center; margin-bottom: 20px; }
-        input, button { width: 100%; padding: 12px; margin-bottom: 10px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; }
-        button { background: var(--tg-theme-button-color, #3390ec); color: white; border: none; font-weight: bold; cursor: pointer; }
-        .item { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; }
-        .red { color: red; } .green { color: green; }
+        :root { --bg: #efeff4; --card: #ffffff; --hint: #8e8e93; --blue: #007aff; --red: #ff3b30; --green: #4cd964; }
+        body { font-family: -apple-system, sans-serif; background: var(--bg); margin: 0; padding: 15px; }
+        .grid { display: flex; gap: 10px; margin-bottom: 15px; }
+        .card { background: var(--card); padding: 15px; border-radius: 12px; flex: 1; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .label { font-size: 12px; color: var(--hint); text-transform: uppercase; }
+        .val { font-size: 20px; font-weight: bold; margin-top: 5px; }
+        .history-card { background: var(--card); border-radius: 12px; padding: 10px; margin-top: 15px; }
+        .tx-item { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #eee; }
+        canvas { max-height: 200px; }
     </style>
 </head>
 <body>
 
-    <div class="balance" id="balance">0 ₽</div>
+    <div class="grid">
+        <div class="card">
+            <div class="label">Кошелек</div>
+            <div class="val" id="wallet">0 ₸</div>
+        </div>
+        <div class="card" style="border-bottom: 3px solid orange;">
+            <div class="label">Копилка</div>
+            <div class="val" id="savings">0 ₸</div>
+        </div>
+    </div>
 
-    <input type="number" id="sum" placeholder="Сумма (150)">
-    <input type="text" id="cat" placeholder="На что? (Продукты)">
-    <button onclick="add()">Добавить расход</button>
+    <div class="card">
+        <div class="label">Расходы по категориям</div>
+        <canvas id="chart"></canvas>
+    </div>
 
-    <div id="history">Загрузка...</div>
+    <div class="history-card" id="history">
+        <div class="label">Последние операции</div>
+    </div>
 
     <script>
-        // ТВОИ ДАННЫЕ С КАРТИНКИ
-        const firebaseConfig = {
-            apiKey: "AIzaSyB0FqDYXnDGRnXVXjkikbaNNePDvgDXAWc",
-            authDomain: "burzhuy-pro-v2.firebaseapp.com",
-            projectId: "burzhuy-pro-v2",
-            storageBucket: "burzhuy-pro-v2.firebasestorage.app",
-            messagingSenderId: "627105413900",
-            appId: "1:627105413900:web:3e4d8563e50a542f256729",
-            measurementId: "G-YWYR0HFXE4"
-        };
-
-        firebase.initializeApp(firebaseConfig);
-        const db = firebase.firestore();
         const tg = window.Telegram.WebApp;
+        const userId = tg.initDataUnsafe?.user?.id || 'test_user';
+        let myChart = null;
+
+        async function load() {
+            const res = await fetch(`/api/stats/${userId}`);
+            const data = await res.json();
+
+            document.getElementById('wallet').innerText = data.wallet + ' ₸';
+            document.getElementById('savings').innerText = data.savings + ' ₸';
+
+            // Список истории
+            const histDiv = document.getElementById('history');
+            histDiv.innerHTML = '<div class="label">Последние операции</div>';
+            data.history.reverse().forEach(tx => {
+                histDiv.innerHTML += `
+                    <div class="tx-item">
+                        <div>${tx.cat}</div>
+                        <div style="color: ${tx.amount > 0 ? 'var(--green)' : 'black'}">
+                            ${tx.amount > 0 ? '+' : ''}${tx.amount}
+                        </div>
+                    </div>`;
+            });
+
+            // График
+            const ctx = document.getElementById('chart').getContext('2d');
+            if(myChart) myChart.destroy();
+            myChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: Object.keys(data.categories),
+                    datasets: [{ data: Object.values(data.categories), backgroundColor: ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0'] }]
+                }
+            });
+        }
+
         tg.expand();
-
-        // ID юзера
-        const userId = tg.initDataUnsafe?.user?.id ? String(tg.initDataUnsafe.user.id) : "test_user_pc";
-
-        function render() {
-            db.collection('users').doc(userId).collection('transactions')
-              .orderBy('date', 'desc').limit(20)
-              .onSnapshot(snap => {
-                let total = 0;
-                let html = '';
-                snap.forEach(doc => {
-                    const d = doc.data();
-                    total += d.amount;
-                    html += `<div class="item"><span>${d.cat}</span><b class="${d.amount < 0 ? 'red' : 'green'}">${d.amount}</b></div>`;
-                });
-                document.getElementById('balance').innerText = total + ' ₽';
-                document.getElementById('history').innerHTML = html || 'Пусто';
-            });
-        }
-
-        function add() {
-            const sum = parseFloat(document.getElementById('sum').value);
-            const cat = document.getElementById('cat').value || 'Прочее';
-            if(!sum) return;
-
-            db.collection('users').doc(userId).collection('transactions').add({
-                amount: -Math.abs(sum), // Минус, так как расход
-                cat: cat,
-                date: firebase.firestore.FieldValue.serverTimestamp()
-            });
-            document.getElementById('sum').value = '';
-            document.getElementById('cat').value = '';
-        }
-
-        render();
+        load();
     </script>
 </body>
 </html>
