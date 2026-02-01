@@ -1,9 +1,8 @@
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const admin = require('firebase-admin');
-const path = require('path');
+const axios = require('axios');
 
-// Инициализация Firebase
 if (!admin.apps.length) {
     admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
 }
@@ -13,88 +12,72 @@ const app = express();
 
 app.use(express.static('public'));
 
-// --- УМНЫЙ ПАРСЕР ---
-function parseFinance(text) {
-    const msg = text.toLowerCase();
-    const amountMatch = msg.match(/(\d+[.,]?\d*)\s*([kкк]?)/i);
-    if (!amountMatch) return null;
+// --- ФУНКЦИЯ НЕЙРОСЕТИ (OpenRouter) ---
+async function parseWithAI(text) {
+    try {
+        const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+            model: 'mistralai/mistral-7b-instruct:free', // Бесплатная модель
+            messages: [{
+                role: 'system',
+                content: `Ты финансовый ассистент. Преврати текст в JSON. 
+                Кошельки: 'main' (баланс), 'deposit' (копилка), 'borrowed' (я взял в долг), 'lent' (я дал в долг).
+                Правила:
+                - "Депозит/копилка 5000": wallet='deposit', amount=-5000
+                - "Взял в долг 2000": wallet='borrowed', amount=2000
+                - "Дал в долг 3000": wallet='lent', amount=-3000
+                - Обычные траты (еда, такси): wallet='main', amount=отрицательный.
+                - Доходы (зарплата): wallet='main', amount=положительный.
+                Верни ТОЛЬКО JSON: {"amount": число, "category": "строка", "wallet": "строка"}`
+            }, { role: 'user', content: text }],
+        }, {
+            headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' }
+        });
 
-    let amount = parseFloat(amountMatch[1].replace(',', '.'));
-    if (amountMatch[2]) amount *= 1000;
-
-    let category = text.replace(amountMatch[0], '').trim() || 'Прочее';
-    let wallet = 'main'; 
-    let sign = -1;
-
-    if (msg.includes('депозит') || msg.includes('копилка')) {
-        wallet = 'deposit'; category = '💰 Депозит'; sign = -1;
-    } else if (msg.includes('взял в долг')) {
-        wallet = 'borrowed'; category = '🔴 Взял долг'; sign = 1;
-    } else if (msg.includes('дал в долг')) {
-        wallet = 'lent'; category = '🟢 Дал в долг'; sign = -1;
-    } else if (msg.includes('зарплата') || msg.includes('пришло') || msg.includes('заработал')) {
-        sign = 1; category = 'Работа';
+        return JSON.parse(response.data.choices[0].message.content);
+    } catch (e) {
+        console.error("AI Error:", e.message);
+        return null;
     }
-
-    if (msg.includes('подписка') || msg.includes('netflix') || msg.includes('яндекс')) category = '📺 Подписки';
-
-    return { amount: amount * sign, category, wallet, rawAmount: amount, date: admin.firestore.FieldValue.serverTimestamp() };
 }
 
-// --- API ---
+// --- API ДЛЯ ПРИЛОЖЕНИЯ ---
 app.get('/api/stats/:userId', async (req, res) => {
-    try {
-        const snap = await db.collection('users').doc(req.params.userId).collection('transactions').orderBy('date', 'desc').get();
-        let stats = { main: 0, deposit: 0, borrowed: 0, lent: 0, categories: {}, history: [] };
+    const snap = await db.collection('users').doc(req.params.userId).collection('transactions').orderBy('date', 'desc').get();
+    let s = { main: 0, deposit: 0, borrowed: 0, lent: 0, categories: {}, history: [] };
 
-        snap.forEach(doc => {
-            const d = doc.data();
-            const val = d.amount;
-            if (d.wallet === 'deposit') { stats.deposit += Math.abs(val); stats.main -= Math.abs(val); }
-            else if (d.wallet === 'borrowed') { stats.borrowed += Math.abs(val); stats.main += Math.abs(val); }
-            else if (d.wallet === 'lent') { stats.lent += Math.abs(val); stats.main -= Math.abs(val); }
-            else { stats.main += val; }
-            if (val < 0) stats.categories[d.category] = (stats.categories[d.category] || 0) + Math.abs(val);
-            stats.history.push(d);
-        });
-        res.json(stats);
-    } catch (e) { res.status(500).send(e.message); }
+    snap.forEach(doc => {
+        const d = doc.data();
+        const v = d.amount;
+        if (d.wallet === 'deposit') { s.deposit += Math.abs(v); s.main -= Math.abs(v); }
+        else if (d.wallet === 'borrowed') { s.borrowed += Math.abs(v); s.main += Math.abs(v); }
+        else if (d.wallet === 'lent') { s.lent += Math.abs(v); s.main -= Math.abs(v); }
+        else { s.main += v; }
+        if (v < 0) s.categories[d.category] = (s.categories[d.category] || 0) + Math.abs(v);
+        s.history.push(d);
+    });
+    res.json(s);
 });
 
-// --- КОМАНДЫ БОТА ---
-bot.start((ctx) => {
-    ctx.reply('Салем! Я твой финансовый бро 🇰🇿', 
-    Markup.keyboard([
-        [Markup.button.webApp('📊 Мой учет ₸', process.env.APP_URL)],
-        ['📥 Экспорт в Excel', '❓ Справка']
-    ]).resize());
-});
-
-// ЭКСПОРТ (БЕЗ БИБЛИОТЕК)
-bot.hears('📥 Экспорт в Excel', async (ctx) => {
-    try {
-        const snap = await db.collection('users').doc(String(ctx.from.id)).collection('transactions').get();
-        if (snap.empty) return ctx.reply('История пуста');
-
-        // Создаем CSV вручную
-        let csv = 'Дата,Сумма,Категория,Кошелек\n';
-        snap.forEach(doc => {
-            const d = doc.data();
-            const date = d.date ? d.date.toDate().toLocaleDateString() : '';
-            csv += `${date},${d.amount},${d.category},${d.wallet}\n`;
-        });
-
-        ctx.replyWithDocument({ source: Buffer.from(csv), filename: 'finances.csv' });
-    } catch (e) { ctx.reply('Ошибка экспорта: ' + e.message); }
-});
-
+// --- ЛОГИКА БОТА ---
 bot.on('text', async (ctx) => {
-    const data = parseFinance(ctx.message.text);
-    if (!data) return;
-    if (Math.abs(data.amount) > 50000) ctx.reply('⚠️ Крупная трата!');
-    await db.collection('users').doc(String(ctx.from.id)).collection('transactions').add(data);
-    ctx.reply(`✅ Записал: ${Math.abs(data.amount)} ₸`);
+    if (ctx.message.text.startsWith('/')) return;
+    
+    const waitMsg = await ctx.reply('⏳ Думаю...');
+    const aiData = await parseWithAI(ctx.message.text);
+    await ctx.deleteMessage(waitMsg.message_id);
+
+    if (aiData) {
+        await db.collection('users').doc(String(ctx.from.id)).collection('transactions').add({
+            ...aiData, date: admin.firestore.FieldValue.serverTimestamp()
+        });
+        const status = aiData.amount > 0 ? '💰 Пришло' : '📉 Ушло';
+        ctx.reply(`${status}: ${Math.abs(aiData.amount)} ₸\nКатегория: ${aiData.category}\nКошелек: ${aiData.wallet}`);
+    } else {
+        ctx.reply('Не понял тебя. Попробуй: "Такси 1500" или "Депозит 20к"');
+    }
 });
+
+bot.start(ctx => ctx.reply('Салем! 🇰🇿 Я запомню каждую твою покупку.', Markup.keyboard([[Markup.button.webApp('📊 Мой учет ₸', process.env.APP_URL)]]).resize()));
 
 bot.launch();
-app.listen(process.env.PORT || 3000, () => console.log('Server started'));
+app.listen(process.env.PORT || 3000);
