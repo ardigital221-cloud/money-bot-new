@@ -1,22 +1,18 @@
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const admin = require('firebase-admin');
-const path = require('path');
+const { Parser } = require('json2csv');
 
-// Инициализация Firebase
 if (!admin.apps.length) {
-    admin.initializeApp({
-        credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
-    });
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
 }
 const db = admin.firestore();
-
-const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const app = express();
 
 app.use(express.static('public'));
 
-// --- ЛОГИКА ПАРСИНГА (Заменяет AI на первое время) ---
+// --- УМНЫЙ ПАРСЕР (4 Кошелька + Подписки) ---
 function parseFinance(text) {
     const msg = text.toLowerCase();
     const amountMatch = msg.match(/(\d+[.,]?\d*)\s*([kкк]?)/i);
@@ -25,75 +21,83 @@ function parseFinance(text) {
     let amount = parseFloat(amountMatch[1].replace(',', '.'));
     if (amountMatch[2]) amount *= 1000;
 
-    let category = text.replace(amountMatch[0], '').trim() || 'Разное';
-    let is_savings = false;
-    let is_debt = false;
-    let type = 'expense';
+    let category = text.replace(amountMatch[0], '').trim() || 'Прочее';
+    let wallet = 'main'; 
+    let sign = -1;
 
-    if (msg.includes('копилка') || msg.includes('отложил')) {
-        is_savings = true;
-        category = 'Копилка';
-    }
-    if (msg.includes('долг') || msg.includes('одолжил')) {
-        is_debt = true;
-        category = 'Долги';
-    }
-    if (msg.includes('зарплата') || msg.includes('пришло') || msg.includes('доход')) {
-        type = 'income';
+    // Логика кошельков
+    if (msg.includes('депозит') || msg.includes('копилка')) {
+        wallet = 'deposit'; category = '💰 Депозит'; sign = -1;
+    } else if (msg.includes('взял в долг')) {
+        wallet = 'borrowed'; category = '🔴 Взял долг'; sign = 1;
+    } else if (msg.includes('дал в долг')) {
+        wallet = 'lent'; category = '🟢 Дал в долг'; sign = -1;
+    } else if (msg.includes('зарплата') || msg.includes('пришло') || msg.includes('заработал')) {
+        sign = 1; category = 'Работа';
     }
 
-    return {
-        amount: type === 'expense' ? -Math.abs(amount) : Math.abs(amount),
-        category,
-        is_savings,
-        is_debt,
-        date: admin.firestore.FieldValue.serverTimestamp()
-    };
+    // Идея 2: Подписки
+    const isSubscription = msg.includes('подписка') || msg.includes('netflix') || msg.includes('яндекс');
+    if (isSubscription) category = '📺 Подписки';
+
+    return { amount: amount * sign, category, wallet, rawAmount: amount, isSubscription };
 }
 
 // --- API ДЛЯ МИНИ-ПРИЛОЖЕНИЯ ---
 app.get('/api/stats/:userId', async (req, res) => {
-    const userId = req.params.userId;
-    const snapshot = await db.collection('users').doc(userId).collection('transactions').get();
-    
-    let wallet = 0;
-    let savings = 0;
-    let debt = 0;
-    let history = [];
-    let categories = {};
+    const snap = await db.collection('users').doc(req.params.userId).collection('transactions').orderBy('date', 'desc').get();
+    let stats = { main: 0, deposit: 0, borrowed: 0, lent: 0, categories: {}, history: [] };
 
-    snapshot.forEach(doc => {
-        const data = doc.data();
-        const val = data.amount;
-        
-        if (data.is_savings) savings += Math.abs(val);
-        else if (data.is_debt) debt += Math.abs(val);
-        else wallet += val;
+    snap.forEach(doc => {
+        const d = doc.data();
+        const val = d.amount;
+        if (d.wallet === 'deposit') { stats.deposit += Math.abs(val); stats.main -= Math.abs(val); }
+        else if (d.wallet === 'borrowed') { stats.borrowed += Math.abs(val); stats.main += Math.abs(val); }
+        else if (d.wallet === 'lent') { stats.lent += Math.abs(val); stats.main -= Math.abs(val); }
+        else { stats.main += val; }
 
-        if (val < 0) {
-            categories[data.cat] = (categories[data.cat] || 0) + Math.abs(val);
-        }
-        
-        history.push({ ...data, id: doc.id });
+        if (val < 0) stats.categories[d.category] = (stats.categories[d.category] || 0) + Math.abs(val);
+        stats.history.push(d);
     });
-
-    res.json({ wallet, savings, debt, history: history.slice(-20), categories });
+    res.json(stats);
 });
 
 // --- КОМАНДЫ БОТА ---
-bot.on('text', async (ctx) => {
-    if (ctx.message.text.startsWith('/')) return;
-    const res = parseFinance(ctx.message.text);
-    if (res) {
-        await db.collection('users').doc(String(ctx.from.id)).collection('transactions').add(res);
-        ctx.reply(`✅ Записал: ${res.amount} ₸ в "${res.category}"`);
-    }
+bot.start((ctx) => {
+    ctx.reply('Салем! Я твой финансовый бро 🇰🇿', 
+    Markup.keyboard([
+        [Markup.button.webApp('📊 Мой учет ₸', process.env.APP_URL)],
+        ['📥 Экспорт в Excel', '❓ Справка']
+    ]).resize());
 });
 
-bot.start((ctx) => {
-    ctx.reply('Салем! Веду учет. Жми кнопку или пиши текстом.', Markup.keyboard([
-        [Markup.button.webApp('📊 Открыть приложение', process.env.APP_URL)]
-    ]).resize());
+// Идея 10: Экспорт в Excel
+bot.hears('📥 Экспорт в Excel', async (ctx) => {
+    const snap = await db.collection('users').doc(String(ctx.from.id)).collection('transactions').get();
+    const data = snap.docs.map(doc => {
+        const d = doc.data();
+        return { Дата: d.date.toDate().toLocaleDateString(), Сумма: d.amount, Категория: d.category, Кошелек: d.wallet };
+    });
+    const parser = new Parser();
+    const csv = parser.parse(data);
+    ctx.replyWithDocument({ source: Buffer.from(csv), filename: 'finances.csv' });
+});
+
+bot.on('text', async (ctx) => {
+    const data = parseFinance(ctx.message.text);
+    if (!data) return;
+
+    // Идея 3: Умное уведомление
+    if (Math.abs(data.amount) > 50000) ctx.reply('⚠️ Ого, крупная трата! Ты уверен?');
+
+    await db.collection('users').doc(String(ctx.from.id)).collection('transactions').add({
+        ...data, date: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // Идея 9: Достижения
+    let achievement = "✅ Записал";
+    if (data.rawAmount > 100000) achievement = "🏆 Уровень: Инвестор";
+    ctx.reply(`${achievement}: ${Math.abs(data.amount)} ₸`);
 });
 
 bot.launch();
