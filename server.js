@@ -3,7 +3,6 @@ const { Telegraf, Markup } = require('telegraf');
 const admin = require('firebase-admin');
 const axios = require('axios');
 
-// Инициализация Firebase
 if (!admin.apps.length) {
     admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
 }
@@ -13,22 +12,39 @@ const app = express();
 
 app.use(express.static('public'));
 
-// --- НЕЙРОСЕТЬ ---
+// --- ЗАПАСНОЙ ПАРСЕР (если AI упал) ---
+function fallbackParse(text) {
+    const msg = text.toLowerCase();
+    const amountMatch = msg.match(/(\d+[.,]?\d*)\s*([kкк]?)/i);
+    if (!amountMatch) return null;
+    let amount = parseFloat(amountMatch[1].replace(',', '.'));
+    if (amountMatch[2]) amount *= 1000;
+    let category = text.replace(amountMatch[0], '').replace(/привет|бро|але|слыш/gi, '').trim() || 'Прочее';
+    return { amount: -Math.abs(amount), category: category, wallet: 'main' };
+}
+
+// --- УЛУЧШЕННАЯ НЕЙРОСЕТЬ ---
 async function parseWithAI(text) {
     try {
         const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
             model: 'mistralai/mistral-7b-instruct:free',
             messages: [{
                 role: 'system',
-                content: `Ты финансовый ассистент. Преврати текст в JSON. 
-                Кошельки: 'main', 'deposit', 'borrowed', 'lent'.
-                Верни ТОЛЬКО JSON: {"amount": число, "category": "строка", "wallet": "строка"}`
+                content: `Ты финансовый ассистент. Преврати текст в JSON. Кошельки: 'main', 'deposit', 'borrowed', 'lent'. Ответ должен содержать ТОЛЬКО JSON объект: {"amount": число, "category": "строка", "wallet": "строка"}`
             }, { role: 'user', content: text }],
         }, {
-            headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' }
+            headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
+            timeout: 10000 // Ждем максимум 10 сек
         });
-        return JSON.parse(response.data.choices[0].message.content);
-    } catch (e) { return null; }
+
+        let content = response.data.choices[0].message.content;
+        // Очистка ответа от Markdown (```json ... ```)
+        content = content.replace(/```json|```/g, '').trim();
+        return JSON.parse(content);
+    } catch (e) { 
+        console.log("AI Error, using fallback...");
+        return fallbackParse(text); 
+    }
 }
 
 // --- API ---
@@ -49,17 +65,14 @@ app.get('/api/stats/:userId', async (req, res) => {
     } catch (e) { res.status(500).send(e.message); }
 });
 
-// --- БОТ ---
-bot.start(ctx => ctx.reply('Салем! 🇰🇿', Markup.keyboard([
+bot.start(ctx => ctx.reply('Салем! 🇰🇿 Я слушаю. Напиши трату.', Markup.keyboard([
     [Markup.button.webApp('📊 Мой учет ₸', process.env.APP_URL)],
-    ['📥 Экспорт', '❓ Справка']
+    ['📥 Экспорт']
 ]).resize()));
 
-// ЭКСПОРТ БЕЗ БИБЛИОТЕК
 bot.hears('📥 Экспорт', async (ctx) => {
     const snap = await db.collection('users').doc(String(ctx.from.id)).collection('transactions').get();
-    if (snap.empty) return ctx.reply('Пусто');
-    let csv = '\ufeffДата,Сумма,Категория,Кошелек\n'; // \ufeff для поддержки кириллицы в Excel
+    let csv = '\ufeffДата,Сумма,Категория,Кошелек\n';
     snap.forEach(doc => {
         const d = doc.data();
         const date = d.date ? d.date.toDate().toLocaleDateString() : '';
@@ -70,14 +83,20 @@ bot.hears('📥 Экспорт', async (ctx) => {
 
 bot.on('text', async (ctx) => {
     if (ctx.message.text.startsWith('/')) return;
-    const aiData = await parseWithAI(ctx.message.text);
-    if (aiData) {
+    
+    // Сначала пробуем AI, если он тупит — используем код
+    const data = await parseWithAI(ctx.message.text);
+    
+    if (data && data.amount) {
         await db.collection('users').doc(String(ctx.from.id)).collection('transactions').add({
-            ...aiData, date: admin.firestore.FieldValue.serverTimestamp()
+            ...data, date: admin.firestore.FieldValue.serverTimestamp()
         });
-        ctx.reply(`✅ Записал: ${aiData.amount} ₸`);
-    } else { ctx.reply('Не понял сумму.'); }
+        const icon = data.amount > 0 ? '✅' : '📉';
+        ctx.reply(`${icon} Записал: ${Math.abs(data.amount)} ₸`);
+    } else {
+        ctx.reply('Не понял сумму. Попробуй еще раз (например: "еда 500")');
+    }
 });
 
 bot.launch();
-app.listen(process.env.PORT || 3000, () => console.log('Server started'));
+app.listen(process.env.PORT || 3000);
