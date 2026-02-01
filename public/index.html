@@ -6,76 +6,59 @@
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        :root { --bg: #efeff4; --card: #ffffff; --hint: #8e8e93; --blue: #007aff; --red: #ff3b30; --green: #4cd964; }
-        body { font-family: -apple-system, sans-serif; background: var(--bg); margin: 0; padding: 15px; }
-        .grid { display: flex; gap: 10px; margin-bottom: 15px; }
-        .card { background: var(--card); padding: 15px; border-radius: 12px; flex: 1; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .label { font-size: 12px; color: var(--hint); text-transform: uppercase; }
-        .val { font-size: 20px; font-weight: bold; margin-top: 5px; }
-        .history-card { background: var(--card); border-radius: 12px; padding: 10px; margin-top: 15px; }
-        .tx-item { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #eee; }
-        canvas { max-height: 200px; }
+        :root { --bg: #f2f2f7; --card: #fff; --accent: #007aff; }
+        body { font-family: -apple-system, sans-serif; background: var(--bg); padding: 15px; margin: 0; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .card { background: var(--card); border-radius: 12px; padding: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+        .main-card { grid-column: span 2; background: var(--accent); color: #fff; }
+        .label { font-size: 11px; text-transform: uppercase; opacity: 0.7; font-weight: 600; }
+        .val { font-size: 22px; font-weight: 800; margin-top: 5px; }
+        .history { margin-top: 20px; }
+        .item { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #eee; }
+        .red { color: #ff3b30; } .green { color: #34c759; }
+        canvas { max-height: 200px; margin: 20px 0; }
     </style>
 </head>
 <body>
-
     <div class="grid">
-        <div class="card">
-            <div class="label">Кошелек</div>
-            <div class="val" id="wallet">0 ₸</div>
+        <div class="card main-card">
+            <div class="label">На руках 🇰🇿</div>
+            <div class="val" id="main">0 ₸</div>
         </div>
-        <div class="card" style="border-bottom: 3px solid orange;">
-            <div class="label">Копилка</div>
-            <div class="val" id="savings">0 ₸</div>
-        </div>
+        <div class="card"><div class="label">Депозит 🐷</div><div class="val" id="deposit">0 ₸</div></div>
+        <div class="card"><div class="label">Дал в долг 🟢</div><div class="val" id="lent">0 ₸</div></div>
+        <div class="card" style="border-left: 4px solid #ff3b30;"><div class="label">Взял в долг 🔴</div><div class="val" id="borrowed">0 ₸</div></div>
     </div>
 
-    <div class="card">
-        <div class="label">Расходы по категориям</div>
-        <canvas id="chart"></canvas>
-    </div>
+    <canvas id="chart"></canvas>
 
-    <div class="history-card" id="history">
-        <div class="label">Последние операции</div>
-    </div>
+    <div class="history" id="history"></div>
 
     <script>
         const tg = window.Telegram.WebApp;
-        const userId = tg.initDataUnsafe?.user?.id || 'test_user';
-        let myChart = null;
-
         async function load() {
-            const res = await fetch(`/api/stats/${userId}`);
+            tg.HapticFeedback.impactOccurred('light'); // Вибрация
+            const res = await fetch(`/api/stats/${tg.initDataUnsafe?.user?.id || 'test'}`);
             const data = await res.json();
 
-            document.getElementById('wallet').innerText = data.wallet + ' ₸';
-            document.getElementById('savings').innerText = data.savings + ' ₸';
+            document.getElementById('main').innerText = data.main.toLocaleString() + ' ₸';
+            document.getElementById('deposit').innerText = data.deposit.toLocaleString() + ' ₸';
+            document.getElementById('lent').innerText = data.lent.toLocaleString() + ' ₸';
+            document.getElementById('borrowed').innerText = data.borrowed.toLocaleString() + ' ₸';
 
-            // Список истории
-            const histDiv = document.getElementById('history');
-            histDiv.innerHTML = '<div class="label">Последние операции</div>';
-            data.history.reverse().forEach(tx => {
-                histDiv.innerHTML += `
-                    <div class="tx-item">
-                        <div>${tx.cat}</div>
-                        <div style="color: ${tx.amount > 0 ? 'var(--green)' : 'black'}">
-                            ${tx.amount > 0 ? '+' : ''}${tx.amount}
-                        </div>
-                    </div>`;
-            });
-
-            // График
-            const ctx = document.getElementById('chart').getContext('2d');
-            if(myChart) myChart.destroy();
-            myChart = new Chart(ctx, {
+            new Chart(document.getElementById('chart'), {
                 type: 'doughnut',
                 data: {
                     labels: Object.keys(data.categories),
-                    datasets: [{ data: Object.values(data.categories), backgroundColor: ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0'] }]
+                    datasets: [{ data: Object.values(data.categories), backgroundColor: ['#007aff', '#34c759', '#ff9500', '#ff3b30'] }]
                 }
             });
-        }
 
+            const hist = document.getElementById('history');
+            data.history.forEach(tx => {
+                hist.innerHTML += `<div class="item"><span>${tx.category}</span><span class="${tx.amount > 0 ? 'green' : ''}">${tx.amount.toLocaleString()} ₸</span></div>`;
+            });
+        }
         tg.expand();
         load();
     </script>
